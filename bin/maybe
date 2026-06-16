@@ -1,0 +1,201 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Maybe CLI — a thin, scriptable interface intended primarily for other agents /
+# automation to manage a family's accounts and transactions.
+#
+# Design goals: non-interactive, JSON in / JSON out, predictable exit codes.
+#
+# Exit codes:
+#   0  success (no per-row failures)
+#   1  ran, but one or more rows failed (details in JSON `errors`)
+#   2  fatal error (bad input, unknown command, user not found, ...)
+#
+# Examples:
+#   bin/maybe accounts list
+#   bin/maybe categories list
+#   bin/maybe transactions list --limit 20
+#   echo '[{"account":"现金账户","date":"2026-05-03","name":"京东","amount":-899}]' \
+#     | bin/maybe transactions create
+#   echo '{"name":"招行信用卡","type":"CreditCard"}' | bin/maybe accounts create
+#
+# Notes:
+#   - --user EMAIL selects the family. If omitted and exactly one user exists, it is used.
+#   - transactions create reads a JSON array (or single object) from stdin or --input FILE.
+#   - amount: negative => expense, positive => income. Or pass {"nature":"outflow|inflow"}
+#     with a positive amount.
+
+require_relative "../config/boot"
+require_relative "../config/environment"
+require "json"
+require "optparse"
+
+module MaybeCLI
+  module_function
+
+  def main(argv)
+    command = argv.shift
+    subcommand = argv.shift
+
+    options = {}
+    OptionParser.new do |o|
+      o.banner = "Usage: bin/maybe <command> <subcommand> [options]"
+      o.on("--user EMAIL", "Family owner email (default: MAYBE_CLI_USER, else the only user)") { |v| options[:user] = v }
+      o.on("--input FILE", "Read JSON from FILE instead of stdin") { |v| options[:input] = v }
+      o.on("--limit N", Integer, "Max rows (transactions list)") { |v| options[:limit] = v }
+      o.on("--account NAME", "Filter by account name (transactions list)") { |v| options[:account] = v }
+      o.on("--pretty", "Pretty-print JSON output") { options[:pretty] = true }
+      o.on("-h", "--help", "Show help") { puts o; exit 0 }
+    end.parse!(argv)
+
+    case [ command, subcommand ]
+    in [ "accounts", "list" ]        then accounts_list(options)
+    in [ "accounts", "create" ]      then accounts_create(options)
+    in [ "categories", "list" ]      then categories_list(options)
+    in [ "transactions", "list" ]    then transactions_list(options)
+    in [ "transactions", "create" ]  then transactions_create(options)
+    in [ nil, _ ] | [ "help", _ ]    then usage
+    else
+      die("Unknown command: #{[ command, subcommand ].compact.join(' ')}. Run `bin/maybe help`.")
+    end
+  end
+
+  # --- commands ---------------------------------------------------------------
+
+  def accounts_list(options)
+    accounts = family(options).accounts.order(:name).map do |a|
+      {
+        name: a.name,
+        type: a.accountable_type,
+        currency: a.currency,
+        balance: a.balance_money.format,
+        balance_amount: a.balance.to_s
+      }
+    end
+    emit({ accounts: accounts }, options)
+  end
+
+  def accounts_create(options)
+    attrs = read_json(options)
+    attrs = attrs.with_indifferent_access
+    name = attrs[:name].presence or die("`name` is required")
+    type = (attrs[:type].presence || "Depository")
+
+    unless Accountable::TYPES.include?(type)
+      die("Invalid type '#{type}'. Allowed: #{Accountable::TYPES.join(', ')}")
+    end
+
+    fam = family(options)
+    if fam.accounts.exists?(name: name)
+      die("Account '#{name}' already exists")
+    end
+
+    account = Account.create_and_sync(
+      family: fam,
+      name: name,
+      balance: (attrs[:balance] || 0).to_d,
+      currency: (attrs[:currency].presence || fam.currency),
+      accountable_type: type,
+      accountable_attributes: {}
+    )
+
+    emit({ created: { name: account.name, type: account.accountable_type, currency: account.currency, balance: account.balance_money.format } }, options)
+  end
+
+  def categories_list(options)
+    emit({ categories: family(options).categories.order(:name).pluck(:name) }, options)
+  end
+
+  def transactions_list(options)
+    scope = family(options).transactions
+                           .includes(entry: :account)
+                           .joins(:entry)
+    scope = scope.where(accounts: { name: options[:account] }) if options[:account]
+
+    rows = scope.order("entries.date DESC, entries.created_at DESC")
+                .limit(options[:limit] || 50)
+                .map do |txn|
+      e = txn.entry
+      {
+        date: e.date.to_s,
+        account: e.account.name,
+        name: e.name,
+        amount: e.amount_money.abs.format,
+        classification: e.classification,
+        category: txn.category&.name
+      }
+    end
+    emit({ transactions: rows, count: rows.size }, options)
+  end
+
+  def transactions_create(options)
+    payload = read_json(options)
+    rows = payload.is_a?(Array) ? payload : (payload["transactions"] || [ payload ])
+    die("No transactions provided") if rows.empty?
+
+    result = Transaction::BulkCreator.new(family(options), rows).create
+    emit(result, options)
+    exit 1 if result[:failed_count].to_i.positive?
+  end
+
+  # --- helpers ----------------------------------------------------------------
+
+  def family(options)
+    # Resolution order: --user flag, then MAYBE_CLI_USER env, then the only user.
+    email = options[:user].presence || ENV["MAYBE_CLI_USER"].presence
+
+    user =
+      if email
+        User.find_by(email: email) || die("User not found: #{email}")
+      elsif User.count == 1
+        User.first
+      else
+        die("No user specified. Pass --user EMAIL or set MAYBE_CLI_USER in .env.local.")
+      end
+
+    user.family
+  end
+
+  def read_json(options)
+    raw = options[:input] ? File.read(options[:input]) : $stdin.read
+    die("No JSON input (provide via stdin or --input FILE)") if raw.to_s.strip.empty?
+    JSON.parse(raw)
+  rescue JSON::ParserError => e
+    die("Invalid JSON: #{e.message}")
+  end
+
+  def emit(data, options)
+    puts(options[:pretty] ? JSON.pretty_generate(data) : JSON.generate(data))
+  end
+
+  def die(message)
+    warn(JSON.generate({ error: message }))
+    exit 2
+  end
+
+  def usage
+    puts <<~TXT
+      Maybe CLI — manage accounts and transactions (JSON in / JSON out).
+
+      Commands:
+        accounts list                 List accounts
+        accounts create               Create an account (JSON: {name, type, balance, currency})
+        categories list               List category names
+        transactions list            List recent transactions (--limit, --account)
+        transactions create          Create transactions (JSON array on stdin / --input)
+
+      Common options:
+        --user EMAIL    Select the family (default: MAYBE_CLI_USER in .env.local, else the only user)
+        --input FILE    Read JSON from FILE instead of stdin
+        --pretty        Pretty-print JSON output
+
+      Transaction row schema (string keys):
+        { "account": "现金账户", "date": "2026-05-03", "name": "京东购物",
+          "amount": -899, "category": "购物", "notes": "..." }
+        amount: negative => expense, positive => income.
+        Or use "nature": "outflow"|"inflow" with a positive amount.
+    TXT
+  end
+end
+
+MaybeCLI.main(ARGV)

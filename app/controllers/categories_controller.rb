@@ -4,7 +4,7 @@ class CategoriesController < ApplicationController
   before_action :set_transaction, only: :create
 
   def index
-    @categories = Current.family.categories.alphabetically
+    @categories = Current.family.categories.alphabetically.includes(:subcategories)
 
     render layout: "settings"
   end

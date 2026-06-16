@@ -49,6 +49,20 @@ class Family < ApplicationRecord
     AutoCategorizer.new(self, transaction_ids: transaction_ids).auto_categorize
   end
 
+  # Schedules AI auto-categorization for every transaction that has no category
+  # yet (and whose category hasn't been manually locked). Batches to stay under
+  # the provider's per-request limit. Returns the number of transactions scheduled.
+  def auto_categorize_uncategorized_transactions_later
+    scope = transactions.where(category_id: nil).enrichable(:category_id)
+    count = scope.count
+
+    scope.in_batches(of: 20) do |batch|
+      auto_categorize_transactions_later(batch)
+    end
+
+    count
+  end
+
   def auto_detect_transaction_merchants_later(transactions)
     AutoDetectMerchantsJob.perform_later(self, transaction_ids: transactions.pluck(:id))
   end

@@ -18,7 +18,8 @@ module Assistant::Configurable
           Assistant::Function::GetTransactions,
           Assistant::Function::GetAccounts,
           Assistant::Function::GetBalanceSheet,
-          Assistant::Function::GetIncomeStatement
+          Assistant::Function::GetIncomeStatement,
+          Assistant::Function::CreateTransactions
         ]
       end
 

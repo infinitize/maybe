@@ -4,10 +4,25 @@ class Provider::Openai < Provider
   # Subclass so errors caught in this provider are raised as Provider::Openai::Error
   Error = Class.new(Provider::Error)
 
-  MODELS = %w[gpt-4.1]
+  # Models are configurable so the provider can target any OpenAI-compatible
+  # endpoint (e.g. Alibaba DashScope / Qwen). Comma-separate to allow multiple.
+  MODELS = ENV.fetch("OPENAI_CHAT_MODEL", "gpt-4.1").split(",").map(&:strip)
 
   def initialize(access_token)
-    @client = ::OpenAI::Client.new(access_token: access_token)
+    options = {
+      access_token: access_token,
+      # ruby-openai defaults to 120s. Large, non-streamed tool-call responses
+      # (e.g. creating many transactions at once) can take longer, so make it
+      # configurable and default higher to avoid Net::ReadTimeout.
+      request_timeout: ENV.fetch("OPENAI_REQUEST_TIMEOUT", "600").to_i
+    }
+
+    # Point at an OpenAI-compatible base URL when configured (DashScope, etc.).
+    # When blank, ruby-openai defaults to https://api.openai.com/v1.
+    uri_base = ENV["OPENAI_URI_BASE"].presence
+    options[:uri_base] = uri_base if uri_base
+
+    @client = ::OpenAI::Client.new(**options)
   end
 
   def supports_model?(model)
@@ -38,46 +53,32 @@ class Provider::Openai < Provider
     end
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
+  # Uses the OpenAI-compatible Chat Completions API (/chat/completions) rather than
+  # the OpenAI-proprietary Responses API (/responses), so this works against any
+  # OpenAI-compatible endpoint such as Alibaba DashScope / Qwen.
+  #
+  # Because Chat Completions is stateless, the full conversation is rebuilt on every
+  # call from +message_history+ (instead of relying on +previous_response_id+).
+  def chat_response(prompt, model:, instructions: nil, functions: [], tool_rounds: [], message_history: [], streamer: nil, previous_response_id: nil)
     with_provider_response do
-      chat_config = ChatConfig.new(
-        functions: functions,
-        function_results: function_results
-      )
+      chat_config = ChatConfig.new(functions: functions)
 
-      collected_chunks = []
-
-      # Proxy that converts raw stream to "LLM Provider concept" stream
-      stream_proxy = if streamer.present?
-        proc do |chunk|
-          parsed_chunk = ChatStreamParser.new(chunk).parsed
-
-          unless parsed_chunk.nil?
-            streamer.call(parsed_chunk)
-            collected_chunks << parsed_chunk
-          end
-        end
-      else
-        nil
-      end
-
-      raw_response = client.responses.create(parameters: {
+      parameters = {
         model: model,
-        input: chat_config.build_input(prompt),
-        instructions: instructions,
-        tools: chat_config.tools,
-        previous_response_id: previous_response_id,
-        stream: stream_proxy
-      })
+        messages: chat_config.build_messages(
+          prompt: prompt,
+          instructions: instructions,
+          message_history: message_history,
+          tool_rounds: tool_rounds
+        )
+      }
 
-      # If streaming, Ruby OpenAI does not return anything, so to normalize this method's API, we search
-      # for the "response chunk" in the stream and return it (it is already parsed)
-      if stream_proxy.present?
-        response_chunk = collected_chunks.find { |chunk| chunk.type == "response" }
-        response_chunk.data
-      else
-        ChatParser.new(raw_response).parsed
-      end
+      tools = chat_config.tools
+      parameters[:tools] = tools if tools.any?
+
+      raw_response = client.chat(parameters: parameters)
+
+      ChatParser.new(raw_response).parsed
     end
   end
 

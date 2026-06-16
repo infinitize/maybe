@@ -124,6 +124,7 @@ Rails.application.routes.draw do
   namespace :transactions do
     resource :bulk_deletion, only: :create
     resource :bulk_update, only: %i[new create]
+    resource :auto_categorization, only: :create
   end
 
   resources :transactions, only: %i[index new create show update destroy] do
